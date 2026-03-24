@@ -1,6 +1,7 @@
 """
 EyeM — Animal Classifier: CNN vs Vision Transformer
 Streamlit app that classifies animal images using two ML models and compares their predictions.
+Supports both general ImageNet-1k models and fine-tuned 525 Bird Species models.
 """
 
 import streamlit as st
@@ -18,6 +19,7 @@ from plotly.subplots import make_subplots
 from scipy.stats import entropy as scipy_entropy
 import json
 import io
+import os
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -72,9 +74,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-CNN_MODEL_ID = "efficientnet_b0"
-VIT_MODEL_ID = "google/vit-base-patch16-224"
-TOP_K = 10
+CNN_MODEL_ID    = "efficientnet_b0"
+VIT_MODEL_ID    = "google/vit-base-patch16-224"
+TOP_K           = 10
+MODELS_DIR      = os.path.join(os.path.dirname(__file__), "models")
+CNN_BIRD_CKPT   = os.path.join(MODELS_DIR, "cnn_birds_finetuned.pth")
+VIT_BIRD_CKPT   = os.path.join(MODELS_DIR, "vit_birds_finetuned.pth")
+BIRD_LABELS_PATH = os.path.join(MODELS_DIR, "bird_class_names.json")
 
 ANIMAL_CLASS_RANGES = [(0, 397), (407, 411), (665, 668)]
 ANIMAL_INDICES = set()
@@ -107,6 +113,64 @@ def load_vit_model():
     return model, processor, labels
 
 
+@st.cache_resource(show_spinner=False)
+def load_cnn_bird_model(num_classes, class_names):
+    """Load fine-tuned EfficientNet-B0 for 525 bird species."""
+    import torch.nn as nn
+    base = models.efficientnet_b0(weights=None)
+    in_features = base.classifier[1].in_features
+    base.classifier = nn.Sequential(
+        nn.Dropout(p=0.4, inplace=True),
+        nn.Linear(in_features, 512),
+        nn.SiLU(),
+        nn.Dropout(p=0.2),
+        nn.Linear(512, num_classes),
+    )
+    ckpt = torch.load(CNN_BIRD_CKPT, map_location="cpu")
+    base.load_state_dict(ckpt["model_state_dict"])
+    base.eval()
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    return base, preprocess
+
+
+@st.cache_resource(show_spinner=False)
+def load_vit_bird_model(num_classes, class_names):
+    """Load fine-tuned ViT-B/16 for 525 bird species."""
+    label2id = {c: i for i, c in enumerate(class_names)}
+    id2label = {i: c for i, c in enumerate(class_names)}
+    model = ViTForImageClassification.from_pretrained(
+        VIT_MODEL_ID,
+        num_labels=num_classes,
+        id2label=id2label,
+        label2id=label2id,
+        ignore_mismatched_sizes=True,
+    )
+    ckpt = torch.load(VIT_BIRD_CKPT, map_location="cpu")
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    processor = ViTImageProcessor.from_pretrained(VIT_MODEL_ID)
+    return model, processor
+
+
+# ─── Bird model availability ─────────────────────────────────────────────────
+BIRD_MODELS_AVAILABLE = (
+    os.path.exists(CNN_BIRD_CKPT) and
+    os.path.exists(VIT_BIRD_CKPT) and
+    os.path.exists(BIRD_LABELS_PATH)
+)
+
+if BIRD_MODELS_AVAILABLE:
+    with open(BIRD_LABELS_PATH) as f:
+        BIRD_CLASS_NAMES = json.load(f)
+    NUM_BIRD_CLASSES = len(BIRD_CLASS_NAMES)
+
+
 # ─── Inference ───────────────────────────────────────────────────────────────
 @torch.no_grad()
 def run_cnn(image: Image.Image, model, preprocess, labels):
@@ -137,6 +201,34 @@ def run_vit(image: Image.Image, model, processor, labels):
         "top1_conf": float(probs.max()),
         "top1_idx": int(probs.argmax()),
         "is_animal": int(probs.argmax()) in ANIMAL_INDICES,
+    }
+
+
+@torch.no_grad()
+def run_cnn_bird(image: Image.Image, model, preprocess, class_names):
+    tensor = preprocess(image.convert("RGB")).unsqueeze(0)
+    logits = model(tensor)
+    probs  = torch.softmax(logits, dim=-1).squeeze().numpy()
+    top_idx = probs.argsort()[::-1][:TOP_K]
+    return {
+        "top": [(class_names[i], float(probs[i])) for i in top_idx],
+        "all_probs": probs,
+        "top1_label": class_names[probs.argmax()],
+        "top1_conf": float(probs.max()),
+    }
+
+
+@torch.no_grad()
+def run_vit_bird(image: Image.Image, model, processor, class_names):
+    inputs = processor(images=image.convert("RGB"), return_tensors="pt")
+    logits = model(**inputs).logits
+    probs  = torch.softmax(logits, dim=-1).squeeze().numpy()
+    top_idx = probs.argsort()[::-1][:TOP_K]
+    return {
+        "top": [(class_names[i], float(probs[i])) for i in top_idx],
+        "all_probs": probs,
+        "top1_label": class_names[probs.argmax()],
+        "top1_conf": float(probs.max()),
     }
 
 
@@ -351,6 +443,33 @@ def plot_diff_heatmap(cnn_res, vit_res, top_n=20):
 with st.sidebar:
     st.markdown("## Settings")
 
+    # ── Mode selector ─────────────────────────────────────────────────────────
+    mode_options = ["General Animal Classifier (ImageNet-1k)"]
+    if BIRD_MODELS_AVAILABLE:
+        mode_options.append("Bird Specialist (525 Species — Fine-tuned)")
+    else:
+        mode_options.append("Bird Specialist — Not available (train first)")
+
+    mode = st.radio(
+        "Classification Mode",
+        options=mode_options,
+        index=0,
+        help="Bird Specialist uses models fine-tuned on 89,885 bird images from 525 species.",
+    )
+    BIRD_MODE = "Bird Specialist" in mode and BIRD_MODELS_AVAILABLE
+
+    if not BIRD_MODELS_AVAILABLE:
+        st.info(
+            "Bird Specialist models not found.\n\n"
+            "Train them on Google Colab:\n"
+            "- `notebooks/Train_CNN_Birds_Colab.ipynb`\n"
+            "- `notebooks/Train_ViT_Birds_Colab.ipynb`\n\n"
+            "Then place `cnn_birds_finetuned.pth`, `vit_birds_finetuned.pth`, "
+            "and `bird_class_names.json` into the `models/` folder.",
+            icon="🐦",
+        )
+
+    st.markdown("---")
     show_gradcam = st.checkbox("Show GradCAM (CNN)", value=False,
                                help="Compute GradCAM saliency map for CNN prediction")
     show_attn = st.checkbox("Show Attention Map (ViT)", value=False,
@@ -359,7 +478,20 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### About the Models")
-    st.markdown("""
+    if BIRD_MODE:
+        st.markdown(f"""
+**CNN — EfficientNet-B0 (Bird Fine-tuned)**
+- Fine-tuned on {NUM_BIRD_CLASSES} bird species
+- ~89,885 training images
+- Transfer learning from ImageNet-1k
+
+**ViT — vit-base-patch16-224 (Bird Fine-tuned)**
+- Fine-tuned on {NUM_BIRD_CLASSES} bird species
+- ~89,885 training images
+- Transfer learning from ImageNet-21k
+""")
+    else:
+        st.markdown("""
 **CNN — EfficientNet-B0**
 - ~5.3M parameters
 - MBConv blocks + Squeeze-Excitation
@@ -383,18 +515,34 @@ with st.sidebar:
 """)
 
 # ─── Header ──────────────────────────────────────────────────────────────────
-st.markdown('<div class="main-title">EyeM — Animal Classifier</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">CNN (EfficientNet-B0) vs Vision Transformer (ViT-B/16) — side-by-side prediction comparison</div>',
-            unsafe_allow_html=True)
+if BIRD_MODE:
+    st.markdown('<div class="main-title">EyeM — Bird Classifier</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="subtitle">CNN vs ViT fine-tuned on <b>{NUM_BIRD_CLASSES} bird species</b> '
+        f'(~89,885 training images) — side-by-side comparison</div>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown('<div class="main-title">EyeM — Animal Classifier</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtitle">CNN (EfficientNet-B0) vs Vision Transformer (ViT-B/16) '
+        '— side-by-side prediction comparison</div>',
+        unsafe_allow_html=True,
+    )
 
 # ─── Load models ─────────────────────────────────────────────────────────────
-with st.spinner("Loading CNN model (EfficientNet-B0)..."):
-    cnn_model, cnn_preprocess, cnn_labels = load_cnn_model()
-
-with st.spinner("Loading ViT model (vit-base-patch16-224)..."):
-    vit_model, vit_processor, vit_labels = load_vit_model()
-
-st.success("Both models loaded and ready.", icon="✅")
+if BIRD_MODE:
+    with st.spinner("Loading fine-tuned CNN Bird model..."):
+        cnn_bird_model, cnn_bird_preprocess = load_cnn_bird_model(NUM_BIRD_CLASSES, BIRD_CLASS_NAMES)
+    with st.spinner("Loading fine-tuned ViT Bird model..."):
+        vit_bird_model, vit_bird_processor = load_vit_bird_model(NUM_BIRD_CLASSES, BIRD_CLASS_NAMES)
+    st.success(f"Bird Specialist models loaded — {NUM_BIRD_CLASSES} species.", icon="🐦")
+else:
+    with st.spinner("Loading CNN model (EfficientNet-B0)..."):
+        cnn_model, cnn_preprocess, cnn_labels = load_cnn_model()
+    with st.spinner("Loading ViT model (vit-base-patch16-224)..."):
+        vit_model, vit_processor, vit_labels = load_vit_model()
+    st.success("Both models loaded and ready.", icon="✅")
 
 # ─── Image upload ─────────────────────────────────────────────────────────────
 st.markdown("---")
@@ -421,9 +569,13 @@ if uploaded_file is not None:
     st.markdown("---")
 
     with st.spinner("Running inference..."):
-        cnn_result = run_cnn(image, cnn_model, cnn_preprocess, cnn_labels)
-        vit_result = run_vit(image, vit_model, vit_processor, vit_labels)
-        metrics    = compute_comparison(cnn_result, vit_result)
+        if BIRD_MODE:
+            cnn_result = run_cnn_bird(image, cnn_bird_model, cnn_bird_preprocess, BIRD_CLASS_NAMES)
+            vit_result = run_vit_bird(image, vit_bird_model, vit_bird_processor, BIRD_CLASS_NAMES)
+        else:
+            cnn_result = run_cnn(image, cnn_model, cnn_preprocess, cnn_labels)
+            vit_result = run_vit(image, vit_model, vit_processor, vit_labels)
+        metrics = compute_comparison(cnn_result, vit_result)
 
     # ── Top predictions side by side ──────────────────────────────────────────
     st.markdown("### Predictions")
@@ -435,10 +587,12 @@ if uploaded_file is not None:
         st.markdown(f"**Top prediction:** `{cnn_result['top1_label']}`")
         st.progress(cnn_result["top1_conf"],
                     text=f"Confidence: {cnn_result['top1_conf']*100:.1f}%")
-        animal_tag = "Animal" if cnn_result["is_animal"] else "Non-animal"
-        tag_color  = "badge-agree" if cnn_result["is_animal"] else "badge-disagree"
-        st.markdown(f'<span class="badge {tag_color}">{animal_tag} class</span>',
-                    unsafe_allow_html=True)
+        if BIRD_MODE:
+            st.markdown('<span class="badge badge-agree">Bird Specialist Model</span>', unsafe_allow_html=True)
+        else:
+            animal_tag = "Animal" if cnn_result.get("is_animal") else "Non-animal"
+            tag_color  = "badge-agree" if cnn_result.get("is_animal") else "badge-disagree"
+            st.markdown(f'<span class="badge {tag_color}">{animal_tag} class</span>', unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("**Top predictions:**")
@@ -454,10 +608,12 @@ if uploaded_file is not None:
         st.markdown(f"**Top prediction:** `{vit_result['top1_label']}`")
         st.progress(vit_result["top1_conf"],
                     text=f"Confidence: {vit_result['top1_conf']*100:.1f}%")
-        animal_tag = "Animal" if vit_result["is_animal"] else "Non-animal"
-        tag_color  = "badge-agree" if vit_result["is_animal"] else "badge-disagree"
-        st.markdown(f'<span class="badge {tag_color}">{animal_tag} class</span>',
-                    unsafe_allow_html=True)
+        if BIRD_MODE:
+            st.markdown('<span class="badge badge-agree">Bird Specialist Model</span>', unsafe_allow_html=True)
+        else:
+            animal_tag = "Animal" if vit_result.get("is_animal") else "Non-animal"
+            tag_color  = "badge-agree" if vit_result.get("is_animal") else "badge-disagree"
+            st.markdown(f'<span class="badge {tag_color}">{animal_tag} class</span>', unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("**Top predictions:**")
