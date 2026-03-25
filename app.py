@@ -21,6 +21,7 @@ import json
 import io
 import os
 import warnings
+import torch.nn.functional as F
 warnings.filterwarnings("ignore")
 
 # ─── Page config ─────────────────────────────────────────────────────────────
@@ -114,8 +115,11 @@ def load_vit_model():
 
 
 @st.cache_resource(show_spinner=False)
-def load_cnn_bird_model(num_classes, class_names):
-    """Load fine-tuned EfficientNet-B0 for 525 bird species."""
+def load_cnn_bird_model(num_classes: int, class_names_tuple: tuple):
+    """Load fine-tuned EfficientNet-B0 for 525 bird species.
+
+    class_names_tuple is a tuple (not list) so st.cache_resource can hash it.
+    """
     import torch.nn as nn
     base = models.efficientnet_b0(weights=None)
     in_features = base.classifier[1].in_features
@@ -126,7 +130,7 @@ def load_cnn_bird_model(num_classes, class_names):
         nn.Dropout(p=0.2),
         nn.Linear(512, num_classes),
     )
-    ckpt = torch.load(CNN_BIRD_CKPT, map_location="cpu")
+    ckpt = torch.load(CNN_BIRD_CKPT, map_location="cpu", weights_only=True)
     base.load_state_dict(ckpt["model_state_dict"])
     base.eval()
     preprocess = transforms.Compose([
@@ -140,10 +144,13 @@ def load_cnn_bird_model(num_classes, class_names):
 
 
 @st.cache_resource(show_spinner=False)
-def load_vit_bird_model(num_classes, class_names):
-    """Load fine-tuned ViT-B/16 for 525 bird species."""
-    label2id = {c: i for i, c in enumerate(class_names)}
-    id2label = {i: c for i, c in enumerate(class_names)}
+def load_vit_bird_model(num_classes: int, class_names_tuple: tuple):
+    """Load fine-tuned ViT-B/16 for 525 bird species.
+
+    class_names_tuple is a tuple (not list) so st.cache_resource can hash it.
+    """
+    label2id = {c: i for i, c in enumerate(class_names_tuple)}
+    id2label = {i: c for i, c in enumerate(class_names_tuple)}
     model = ViTForImageClassification.from_pretrained(
         VIT_MODEL_ID,
         num_labels=num_classes,
@@ -151,7 +158,7 @@ def load_vit_bird_model(num_classes, class_names):
         label2id=label2id,
         ignore_mismatched_sizes=True,
     )
-    ckpt = torch.load(VIT_BIRD_CKPT, map_location="cpu")
+    ckpt = torch.load(VIT_BIRD_CKPT, map_location="cpu", weights_only=True)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     processor = ViTImageProcessor.from_pretrained(VIT_MODEL_ID)
@@ -314,28 +321,23 @@ def plot_top_k_comparison(cnn_res, vit_res):
     return fig
 
 
-def plot_probability_overlay(cnn_res, vit_res, top_n=30):
-    """Overlay CNN and ViT probability distributions for top-N combined classes."""
+def plot_probability_overlay(cnn_res, vit_res, all_labels, top_n=30):
+    """Overlay CNN and ViT probability distributions for top-N combined classes.
+
+    all_labels: full list of class name strings matching the probs arrays.
+    """
     cnn_probs = cnn_res["all_probs"]
     vit_probs = vit_res["all_probs"]
 
-    # Union of top-N indices from each model
+    # Union of top-N indices from each model, sorted by combined confidence
     cnn_top_idx = set(cnn_probs.argsort()[::-1][:top_n])
     vit_top_idx = set(vit_probs.argsort()[::-1][:top_n])
-    combined_idx = sorted(cnn_top_idx | vit_top_idx,
-                          key=lambda i: -(cnn_probs[i] + vit_probs[i]))[:top_n]
+    combined_idx = sorted(
+        cnn_top_idx | vit_top_idx,
+        key=lambda i: -(cnn_probs[i] + vit_probs[i]),
+    )[:top_n]
 
-    # Use ViT labels (same ImageNet-1k)
-    labels_list = []
-    for i, model_res in [(0, cnn_res)]:
-        pass
-    # Get labels from whichever is available
-    all_labels = [r[0] for r in cnn_res["top"]] + [r[0] for r in vit_res["top"]]
-
-    # Build from CNN labels list (loaded globally)
-    from torchvision.models import EfficientNet_B0_Weights
-    _labels = EfficientNet_B0_Weights.IMAGENET1K_V1.meta["categories"]
-    idx_labels = [_labels[i] for i in combined_idx]
+    idx_labels = [all_labels[i] for i in combined_idx]
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
@@ -398,16 +400,17 @@ def plot_radar(metrics: dict):
     return fig
 
 
-def plot_diff_heatmap(cnn_res, vit_res, top_n=20):
-    """Bar chart showing prediction probability differences."""
+def plot_diff_heatmap(cnn_res, vit_res, all_labels, top_n=20):
+    """Bar chart showing prediction probability differences.
+
+    all_labels: full list of class name strings matching the probs arrays.
+    """
     cnn_p = cnn_res["all_probs"]
     vit_p = vit_res["all_probs"]
     diff = cnn_p - vit_p
 
     top_diff_idx = np.abs(diff).argsort()[::-1][:top_n]
-    from torchvision.models import EfficientNet_B0_Weights
-    _labels = EfficientNet_B0_Weights.IMAGENET1K_V1.meta["categories"]
-    idx_labels = [_labels[i] for i in top_diff_idx]
+    idx_labels = [all_labels[i] for i in top_diff_idx]
     diff_vals = [diff[i] * 100 for i in top_diff_idx]
     colors = ["#1565C0" if d > 0 else "#2E7D32" for d in diff_vals]
 
@@ -532,10 +535,11 @@ else:
 
 # ─── Load models ─────────────────────────────────────────────────────────────
 if BIRD_MODE:
+    _bird_names_tuple = tuple(BIRD_CLASS_NAMES)
     with st.spinner("Loading fine-tuned CNN Bird model..."):
-        cnn_bird_model, cnn_bird_preprocess = load_cnn_bird_model(NUM_BIRD_CLASSES, BIRD_CLASS_NAMES)
+        cnn_bird_model, cnn_bird_preprocess = load_cnn_bird_model(NUM_BIRD_CLASSES, _bird_names_tuple)
     with st.spinner("Loading fine-tuned ViT Bird model..."):
-        vit_bird_model, vit_bird_processor = load_vit_bird_model(NUM_BIRD_CLASSES, BIRD_CLASS_NAMES)
+        vit_bird_model, vit_bird_processor = load_vit_bird_model(NUM_BIRD_CLASSES, _bird_names_tuple)
     st.success(f"Bird Specialist models loaded — {NUM_BIRD_CLASSES} species.", icon="🐦")
 else:
     with st.spinner("Loading CNN model (EfficientNet-B0)..."):
@@ -565,8 +569,19 @@ with col_preview:
                  use_container_width=True)
 
 # ─── Inference & Results ──────────────────────────────────────────────────────
+MAX_IMAGE_PIXELS = 4096 * 4096   # reject unreasonably large images
+MIN_IMAGE_DIM    = 32            # reject images too small to be meaningful
+
 if uploaded_file is not None:
     st.markdown("---")
+
+    # Validate image dimensions before running inference
+    w, h = image.size
+    if w < MIN_IMAGE_DIM or h < MIN_IMAGE_DIM:
+        st.error(f"Image is too small ({w}×{h}px). Please upload at least {MIN_IMAGE_DIM}×{MIN_IMAGE_DIM}px.")
+        st.stop()
+    if w * h > MAX_IMAGE_PIXELS:
+        st.warning(f"Image is very large ({w}×{h}px) and will be auto-resized for inference.")
 
     with st.spinner("Running inference..."):
         if BIRD_MODE:
@@ -677,14 +692,19 @@ if uploaded_file is not None:
         st.dataframe(metrics_df, hide_index=True, use_container_width=True)
 
     # ── Distribution overlay ───────────────────────────────────────────────────
+    # Resolve the full label list for whichever mode is active
+    _active_labels = BIRD_CLASS_NAMES if BIRD_MODE else cnn_labels
+
     st.markdown("---")
     st.markdown("### Probability Distribution Overlay")
-    st.plotly_chart(plot_probability_overlay(cnn_result, vit_result), use_container_width=True)
+    st.plotly_chart(plot_probability_overlay(cnn_result, vit_result, _active_labels),
+                    use_container_width=True)
 
     # ── Difference chart ──────────────────────────────────────────────────────
     st.markdown("### Prediction Difference Breakdown")
     st.caption("Classes where CNN and ViT differ most in their assigned probabilities.")
-    st.plotly_chart(plot_diff_heatmap(cnn_result, vit_result), use_container_width=True)
+    st.plotly_chart(plot_diff_heatmap(cnn_result, vit_result, _active_labels),
+                    use_container_width=True)
 
     # ── Radar chart ───────────────────────────────────────────────────────────
     col_radar, col_summary = st.columns([1, 1])
@@ -728,16 +748,18 @@ if uploaded_file is not None:
         interp_cols = st.columns(2 if (show_gradcam and show_attn) else 1)
 
         if show_gradcam:
-            import torch.nn.functional as F
-
             col = interp_cols[0] if show_attn else interp_cols[0]
             with col:
                 with st.spinner("Computing GradCAM..."):
                     try:
                         import matplotlib.pyplot as plt
 
-                        cnn_model.eval()
-                        tensor = cnn_preprocess(image.convert("RGB")).unsqueeze(0)
+                        # Use whichever CNN model is active (general or bird fine-tuned)
+                        _cnn_m    = cnn_bird_model    if BIRD_MODE else cnn_model
+                        _cnn_pre  = cnn_bird_preprocess if BIRD_MODE else cnn_preprocess
+
+                        _cnn_m.eval()
+                        tensor = _cnn_pre(image.convert("RGB")).unsqueeze(0)
                         tensor.requires_grad_(True)
 
                         grads_list, acts_list = [], []
@@ -745,11 +767,11 @@ if uploaded_file is not None:
                         def bwd_hook(m, gi, go): grads_list.append(go[0])
                         def fwd_hook(m, i, o):   acts_list.append(o)
 
-                        fh = cnn_model.features[-1].register_forward_hook(fwd_hook)
-                        bh = cnn_model.features[-1].register_backward_hook(bwd_hook)
+                        fh = _cnn_m.features[-1].register_forward_hook(fwd_hook)
+                        bh = _cnn_m.features[-1].register_backward_hook(bwd_hook)
 
-                        logits = cnn_model(tensor)
-                        cnn_model.zero_grad()
+                        logits = _cnn_m(tensor)
+                        _cnn_m.zero_grad()
                         logits[0, logits.argmax()].backward()
 
                         fh.remove(); bh.remove()
@@ -789,9 +811,13 @@ if uploaded_file is not None:
                     try:
                         import matplotlib.pyplot as plt
 
-                        inputs = vit_processor(images=image.convert("RGB"), return_tensors="pt")
+                        # Use whichever ViT model is active (general or bird fine-tuned)
+                        _vit_m    = vit_bird_model    if BIRD_MODE else vit_model
+                        _vit_proc = vit_bird_processor if BIRD_MODE else vit_processor
+
+                        inputs = _vit_proc(images=image.convert("RGB"), return_tensors="pt")
                         with torch.no_grad():
-                            out = vit_model.vit(**inputs, output_attentions=True, return_dict=True)
+                            out = _vit_m.vit(**inputs, output_attentions=True, return_dict=True)
 
                         attn = out.attentions[-1].squeeze(0)   # (12, 197, 197)
                         cls_attn = attn[:, 0, 1:].mean(dim=0).numpy()
